@@ -1,0 +1,16 @@
+[package]
+name = "aisar-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2.93"
+rstar = "0.12.0"  # R-tree 라이브러리
+serde = { version = "1.0", features = ["derive"] }  # JavaScript와의 데이터 직렬화
+serde-wasm-bindgen = "0.6.5"
+web-sys = { version = "0.3.70", features = ["console", "Window", "Document", "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData"] }
+js-sys = "0.3.70"
+getrandom = { version = "0.2", features = ["js"] }
