@@ -1,2 +1,5 @@
 /target/
-/Cargo.lock
+Cargo.lock
+aisar-wasm.iml
+/pkg/
+/.idea/
