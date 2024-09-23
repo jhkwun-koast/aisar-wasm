@@ -82,6 +82,24 @@ pub struct WeatherData {
     pub(crate) vdata: f64,
 }
 
+impl WeatherData {
+    pub fn speed(&self) -> f64 {
+        (self.udata.powi(2) + self.vdata.powi(2)).sqrt()
+    }
+
+    pub fn rotate(&self) -> f64 {
+        self.udata.atan2(self.vdata)
+    }
+
+    pub fn direction_difference(&self, point2: &WeatherData) -> f64 {
+        let dot_product = self.udata * point2.udata + self.vdata * point2.vdata;
+        let magnitude1 = self.speed();
+        let magnitude2 = point2.speed();
+        let cos_theta = dot_product / (magnitude1 * magnitude2);
+        cos_theta.acos() // 각도 차이를 라디안으로 반환
+    }
+}
+
 impl PartialEq for WeatherData {
     fn eq(&self, other: &Self) -> bool {
         Coordinate::eq(&self.coordinate, &other.coordinate) && self.udata == other.udata && self.vdata == other.vdata

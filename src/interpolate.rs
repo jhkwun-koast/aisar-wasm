@@ -18,10 +18,13 @@ fn find_min_data_in_bounds<'a> (
     let mut buffer_size = buffer_size.unwrap_or(10000.0);
     let ratio = ratio.unwrap_or( 1.5);
 
+    let max_attempts = 4; // 최대 시도 횟수
+    let mut attempts = 0; // 현재 시도 횟수
+
     let mut bounds = coordinate.to_bounds(buffer_size);
     let mut points = Vec::new();
 
-    while points.len() < min_points {
+    while points.len() < min_points && attempts < max_attempts  {
         // SimpleBounds를 AABB로 변환
         let bounds_aabb = bounds.to_aabb(); // SimpleBounds를 AABB로 변환하는 함수가 있다고 가정
 
@@ -36,6 +39,7 @@ fn find_min_data_in_bounds<'a> (
         // 3. 최소 포인트에 도달하지 않았으면 버퍼 확장
         buffer_size *= ratio;  // 버퍼 확장
         bounds = coordinate.to_bounds(buffer_size);
+        attempts += 1;
     }
 
     points
@@ -43,6 +47,10 @@ fn find_min_data_in_bounds<'a> (
 
 pub fn interpolate_by_kriging(particle_coord: Coordinate, rtree: &RTree<WeatherData>, min_points: Option<usize>, mask_data: &Vec<u8>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
     let points = find_min_data_in_bounds(particle_coord, rtree, min_points, None, None,mask_data,extent,resolution,size);
+
+    if points.len() == 0 {
+        return (0.0, 0.0);
+    }
 
     let distances: Vec<f64> = points.iter()
         .map(|data| data.coordinate.distance_to(&particle_coord).abs())
@@ -93,6 +101,10 @@ pub fn calculate_kriging_weights(
 
 pub fn interpolate_by_inverse_distance_weighted (particle_coord:Coordinate, rtree: &RTree<WeatherData>, min_points: Option<usize>, mask_data: &Vec<u8>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
     let points = find_min_data_in_bounds(particle_coord, rtree, min_points, None, None,mask_data,extent,resolution,size);
+
+    if points.len() == 0 {
+        return (0.0, 0.0);
+    }
 
     let mut weighted_sum_u = 0.0;
     let mut weighted_sum_v = 0.0;

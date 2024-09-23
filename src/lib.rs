@@ -8,7 +8,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
-use js_sys::{Reflect};
+use std::time::{SystemTime, UNIX_EPOCH};
+use js_sys::{Reflect, Uint8Array};
 use rstar::{RTree, AABB};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -27,6 +28,7 @@ macro_rules! log {
 
 #[derive(Deserialize)]
 pub struct CurrentVectorWrapperOption {
+    data: Vec<(f64, f64, f64, f64)>,
     mask_data: Vec<u8>,
     extent: [f64; 4],
     resolution: f64,
@@ -48,9 +50,8 @@ pub struct DrawCurrentVectorCanvasOption {
 
 #[derive(Deserialize, Debug)]
 pub struct CurrentFlowWrapperOption {
-    depth: usize,
     particle_count:usize,
-    //per_frame_control_particle_count:usize,
+    data: Vec<(f64, f64, f64, f64)>,
     interpolation_type:String,
     extent: [f64; 4],
     resolution: f64,
@@ -134,8 +135,12 @@ impl SimpleBounds {
     }
 
     pub fn contains(&self, point: &WeatherData) -> bool {
-        let longitude = point.coordinate.longitude;
-        let latitude = point.coordinate.latitude;
+        self.containsCoordinate(point.coordinate)
+    }
+
+    pub fn containsCoordinate(&self, coordinate: Coordinate) -> bool {
+        let longitude = coordinate.longitude;
+        let latitude = coordinate.latitude;
 
         longitude >= self.min_x && longitude <= self.max_x && latitude >= self.min_y && latitude <= self.max_y
     }
@@ -148,87 +153,166 @@ pub struct CurrentVectorWrapper {
     bounds: Rc<RefCell<SimpleBounds>>,
     mask_data: Vec<u8>
 }
+fn log_with_time() -> f64 {
+    let window = window().expect("no global `window` exists");
+    let performance = window.performance().expect("performance should be available");
+    performance.now() // 현재 시간을 밀리초 단위로 가져옴
+}
+fn binary_to_current_vector_wrapper_option(binary_data: Uint8Array) -> CurrentVectorWrapperOption {
+    let data_vec = binary_data.to_vec();
+    let mut offset = 0;
 
+    // 1. 헤더에서 dataArrayLength와 maskDataLength 읽기
+    let data_array_length = u32::from_le_bytes(data_vec[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let mask_data_length = u32::from_le_bytes(data_vec[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    //log!("data_array_length {:?}, mask_data_length {:?}, offset {:?}", data_array_length, mask_data_length, offset);
+    let mut data = Vec::new();
+
+    // 2. dataArray 해석 (f64 4개씩: longitude, latitude, udata, vdata)
+    for _ in 0..data_array_length {
+        let longitude = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let latitude = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let udata = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let vdata = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        //log!("longitude {:?}, latitude {:?}, udata {:?}, vdata  {:?}, offset  {:?}", longitude, latitude, udata, vdata, offset);
+        data.push((longitude, latitude, udata, vdata));
+    }
+
+    // 3. mask_data 해석
+    let mask_data = data_vec[offset..offset + mask_data_length].to_vec();
+    offset += mask_data_length;
+    //log!("mask_data length {:?}, offset  {:?}", mask_data.len(), offset);
+
+    // 4. extent 해석 (4개의 64비트 float)
+    let mut extent = [0.0; 4];
+    for i in 0..4 {
+        extent[i] = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+    }
+
+    //log!("extent {:?}, offset  {:?}", extent, offset);
+
+    // 5. resolution 해석 (64비트 float)
+    let resolution = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    //log!("resolution {:?}, offset  {:?}", resolution, offset);
+
+    // 6. size 해석 (64비트 float 2개)
+    let mut size = [0.0; 2];
+    for i in 0..2 {
+        size[i] = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+    }
+
+    //log!("size {:?}, offset  {:?}", size, offset);
+
+    CurrentVectorWrapperOption {
+        data,
+        mask_data,
+        extent,
+        resolution,
+        size,
+    }
+}
 #[wasm_bindgen]
 impl CurrentVectorWrapper {
     #[wasm_bindgen(constructor)]
-    pub fn new(data: JsValue, options: JsValue) -> CurrentVectorWrapper {
+    pub fn new(binary_data: Uint8Array) -> CurrentVectorWrapper {
+        let opts: CurrentVectorWrapperOption = binary_to_current_vector_wrapper_option(binary_data);
 
-        let opts: CurrentVectorWrapperOption = match serde_wasm_bindgen::from_value(options) {
-            Ok(val) => {
-                val
-            },
-            Err(err) => {
-                panic!("Failed to parse options: {:?}", err);
-            }
-        };
-
+        let data = opts.data;
         let mask_data = opts.mask_data;
         let extent = opts.extent;
         let resolution = opts.resolution;
         let size = opts.size;
-
-        let (rtree, bounds, _) =initialize_data(data, &mask_data, SimpleBounds::from_extent(extent), resolution, size, None);
-
+        let (rtree, bounds, _) = initialize_data(data, &mask_data, SimpleBounds::from_extent(extent), resolution, size, None);
+        //log!("rtree {:?}, bounds {:?}", rtree, bounds);
         CurrentVectorWrapper {
             rtree: Rc::new(RefCell::new(rtree)),
             bounds: Rc::new(RefCell::new(bounds)),
             mask_data
         }
     }
+
     fn points_within_eps(&self, rtree_ref:&RTree<WeatherData>, point: WeatherData, eps: f64) -> Vec<WeatherData> {
+        let coord = point.coordinate;
+        let x = coord.longitude;
+        let y = coord.latitude;
+        let sb = SimpleBounds {
+            min_x: x - eps,
+            min_y: y - eps,
+            max_x: x + eps,
+            max_y: y + eps,
+        };
+
         // R-tree에서 eps 거리 내 이웃을 찾음
-        rtree_ref
-            .locate_within_distance(point, eps)
+        /*rtree_ref
+            .locate_within_distance(point, eps)*/
+        rtree_ref.locate_in_envelope(&sb.to_aabb())
             .cloned()
             .collect()
     }
     fn dbscan(&self, eps: f64, min_points: usize) -> Vec<Vec<WeatherData>> {
         let rtree_ref = self.rtree.borrow();
-        let points: Vec<WeatherData> = rtree_ref.iter().cloned().collect(); // 타일 안의 모든 포인트 추출
-        let mut cluster_labels = vec![None; points.len()]; // 포인트별 클러스터 레이블
-        let mut clusters: Vec<Vec<WeatherData>> = Vec::new(); // 클러스터 리스트
+        let points: Vec<WeatherData> = rtree_ref.iter().cloned().collect();
+
+        let mut point_index_map: HashMap<usize, WeatherData> = points.into_iter().enumerate().collect();
+
+        let mut clusters: Vec<Vec<WeatherData>> = Vec::new();
         let mut cluster_id = 0;
+        let eps_speed = 0.2;
+        let eps_direction = 0.4;
 
-        for (i, point) in points.iter().enumerate() {
-            if cluster_labels[i].is_some() {
-                continue; // 이미 처리된 포인트는 스킵
-            }
+        while let Some((i, point)) = point_index_map.iter().next().map(|(&i, point)| (i, point.clone())) {
+            // 거리 기반 이웃 찾기
+            let neighbors = self.points_within_eps(&*rtree_ref, point.clone(), eps);
 
-            // eps 반경 내 이웃 포인트 찾기
-            let neighbors = self.points_within_eps(&*rtree_ref, *point, eps);
+            // 속도 및 방향 기준을 적용한 유효한 이웃 필터링
+            /*let valid_neighbors: Vec<_> = neighbors.into_iter()
+                .filter(|neighbor| {
+                    let speed_diff = (point.speed() - neighbor.speed()).abs();
+                    let direction_diff = point.direction_difference(neighbor);
+                    speed_diff <= eps_speed && direction_diff <= eps_direction
+                })
+                .collect();*/
+
             if neighbors.len() < min_points {
-                // 노이즈 포인트를 처리할 필요가 있으면, 여기에 추가하거나 건너뛸 수 있음
+                // 노이즈 포인트 처리
+                clusters.push(vec![point.clone()]);
+                point_index_map.remove(&i); // 처리된 포인트는 HashMap에서 제거
                 continue;
             }
 
             // 새로운 클러스터 생성
             clusters.push(Vec::new());
-            clusters[cluster_id].push(point.clone()); // 현재 포인트를 클러스터에 추가
-            cluster_labels[i] = Some(cluster_id);
+            clusters[cluster_id].push(point.clone());
 
-            let mut j = 0;
-            while j < clusters[cluster_id].len() {
-                let current_point = clusters[cluster_id][j].clone();
-                let current_neighbors = self.points_within_eps(&*rtree_ref, current_point, eps);
-
-                if current_neighbors.len() >= min_points {
-                    for neighbor in current_neighbors {
-                        let idx = points.iter().position(|p| *p == neighbor).unwrap();
-                        if cluster_labels[idx].is_none() {
-                            clusters[cluster_id].push(points[idx].clone());
-                            cluster_labels[idx] = Some(cluster_id);
-                        }
-                    }
+            // 이웃들과 클러스터링 처리
+            for neighbor in neighbors {
+                let idx = point_index_map.iter().find_map(|(idx, p)| if *p == neighbor { Some(*idx) } else { None });
+                if let Some(idx) = idx {
+                    clusters[cluster_id].push(point_index_map.remove(&idx).unwrap());
                 }
-                j += 1;
             }
 
+            // 현재 포인트도 클러스터링 완료 후 제거
+            point_index_map.remove(&i);
             cluster_id += 1;
         }
 
         clusters
     }
+
     pub fn drawCanvasCurrentVecor(&self, options:JsValue) -> Result<HtmlCanvasElement, JsValue> {
         let opts: DrawCurrentVectorCanvasOption = serde_wasm_bindgen::from_value(options)?;
         let size = opts.size;
@@ -265,14 +349,30 @@ impl CurrentVectorWrapper {
         let rtree_borrowed = self.rtree.borrow();
 
         if sampling_type == "dbscan" {
-            let cluster_labels = &self.dbscan(dbscan_eps_value, dbscan_minpoint_value);
-            log!("cluster_labels {:?}", cluster_labels.len());
-            for wd_group in cluster_labels {
-                log!("cluster_labels {:?}", wd_group.len());
-                for wd in wd_group {
-                    draw_vector(&ctx, *wd, extent, resolution, debug);
+            let mut a = 0;
+            let mut b = 0;
+            let sample_size = 3;
+            let cluster_points_vector = &self.dbscan(dbscan_eps_value, dbscan_minpoint_value);
+
+            for wd_group in cluster_points_vector {
+                if wd_group.len() > 1 {
+                    b += 1;
+                    log!("cluster size {:?}", wd_group.len());
+                }
+                let sample_size = sample_size.min(wd_group.len()); // 클러스터의 포인트보다 큰 샘플은 방지
+                let random_indices = get_random_index(wd_group.len(), sample_size); // 랜덤 인덱스 생성
+
+                let sample: Vec<WeatherData> = random_indices
+                    .iter()
+                    .map(|&i| wd_group[i].clone()) // 인덱스를 기반으로 포인트 복사
+                    .collect();
+
+                for wd in sample {
+                    draw_vector(&ctx, wd, extent, resolution, debug);
+                    a += 1;
                 }
             }
+            log!("render point len {:?}, cluster len {:?}", a, b);
         } else {
             for data in rtree_borrowed.iter()
                 .enumerate()
@@ -329,6 +429,80 @@ impl Particle {
     }
 }
 
+fn binary_to_current_flow_wrapper_option(binary_data: Uint8Array) -> CurrentFlowWrapperOption {
+    let data_vec = binary_data.to_vec();
+    let mut offset = 0;
+
+    // 1. dataArrayLength와 maskDataLength 읽기
+    let data_array_length = u32::from_le_bytes(data_vec[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let mask_data_length = u32::from_le_bytes(data_vec[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut data = Vec::new();
+
+    // 2. dataArray 해석
+    for _ in 0..data_array_length {
+        let longitude = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let latitude = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let udata = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let vdata = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        data.push((longitude, latitude, udata, vdata));
+    }
+
+    // 3. mask_data 해석
+    let mask_data = data_vec[offset..offset + mask_data_length].to_vec();
+    offset += mask_data_length;
+
+    // 4. extent 해석
+    let mut extent = [0.0; 4];
+    for i in 0..4 {
+        extent[i] = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+    }
+
+    // 5. resolution 해석
+    let resolution = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    // 6. size 해석
+    let mut size = [0.0; 2];
+    for i in 0..2 {
+        size[i] = f64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+    }
+
+    // 7. particle_count 해석 (8바이트)
+    let particle_count = u64::from_le_bytes(data_vec[offset..offset + 8].try_into().unwrap()) as usize;
+    offset += 8;
+
+    // 8. interpolation_type 해석 (문자열)
+    let string_length = u32::from_le_bytes(data_vec[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let string_bytes = &data_vec[offset..offset + string_length];
+    let interpolation_type = String::from_utf8(string_bytes.to_vec()).unwrap();
+    offset += string_length;
+
+    // CurrentVectorWrapperOption 구조체 반환
+    CurrentFlowWrapperOption {
+        data,
+        mask_data,
+        extent,
+        resolution,
+        size,
+        particle_count,
+        interpolation_type,
+    }
+}
+
 #[wasm_bindgen]
 pub struct CurrentFlowWrapper {
     tiling_system: Rc<RefCell<TilingSystem>>,  // Rc<RefCell<TilingSystem>>로 감쌈
@@ -347,29 +521,21 @@ pub struct CurrentFlowWrapper {
 #[wasm_bindgen]
 impl CurrentFlowWrapper {
     #[wasm_bindgen(constructor)]
-    pub fn new(data: JsValue, options: JsValue ) -> CurrentFlowWrapper {
-        let opts: CurrentFlowWrapperOption = match serde_wasm_bindgen::from_value(options) {
-            Ok(val) => {
-                val
-            },
-            Err(err) => {
-                panic!("Failed to parse options: {:?}", err);
-            }
-        };
+    pub fn new(binary_data:Uint8Array ) -> CurrentFlowWrapper {
+        let opts: CurrentFlowWrapperOption = binary_to_current_flow_wrapper_option(binary_data);
 
-        let depth = opts.depth;
         let particle_count = opts.particle_count;
-        //let per_frame_control_particle_count = opts.per_frame_control_particle_count;
         let interpolation_type = opts.interpolation_type;
         let extent = opts.extent;
         let resolution = opts.resolution;
         let size = opts.size;
         let mask_data = opts.mask_data;
-        let (rtree, bounds, particles) =initialize_data(data, &mask_data, SimpleBounds::from_extent(extent), resolution, size, Some(particle_count));
+        let data = opts.data;
+        let (rtree, bounds, particles) = initialize_data(data, &mask_data, SimpleBounds::from_extent(extent), resolution, size, Some(particle_count as usize));
         let first_tile = Tile {rtree, bounds, depth: 0 };
 
         // 타일링 시스템 초기화
-        let mut tiling_system = TilingSystem::new(depth as i32);
+        let mut tiling_system = TilingSystem::new(0);
 
         tiling_system.tiles_by_depth.entry(0)
             .or_insert_with(Vec::new)
@@ -384,7 +550,7 @@ impl CurrentFlowWrapper {
             extent,
             resolution,
             size,
-            depth,
+            depth: 0,
             mask_data
         }
     }
@@ -421,8 +587,17 @@ impl CurrentFlowWrapper {
 
     // 파티클을 추가하는 메서드
     fn add_particles(&mut self, num_to_add: usize) {
-        let particles = generate_particles(SimpleBounds::from_extent(self.extent), num_to_add, &self.mask_data, self.resolution, self.size);
-        self.particles.extend(particles);
+        let borrow_ref = self.tiling_system.borrow();
+        if let Some(root_tiles) = borrow_ref.tiles_by_depth.get(&0) {
+            let &unwrap_root_tile = &root_tiles.get(0).unwrap();
+            let rtree = &unwrap_root_tile.rtree;
+            let rtree_ref = rtree;
+            let bounds = rtree_ref.root().envelope();
+            let simple_bounds = SimpleBounds::from_aabb_point(&bounds);
+
+            let particles = generate_particles(SimpleBounds::from_extent(self.extent), num_to_add, &self.mask_data, simple_bounds, self.resolution, self.size);
+            self.particles.extend(particles);
+        }
     }
 
     // 파티클을 제거하는 메서드
@@ -473,11 +648,13 @@ impl CurrentFlowWrapper {
                 for (_, particle) in self.particles.iter_mut().enumerate() {
                     let pixel = to_pixel(particle.coordinate.longitude, particle.coordinate.latitude, extent, resolution);
                     let rtree_ref = rtree;
+                    let bounds = rtree_ref.root().envelope();
+                    let simple_bounds = SimpleBounds::from_aabb_point(&bounds);
 
                     handle_particle(particle, rtree_ref, &self.interpolation_type, &exaggeration, pixel, &self.mask_data, extent, resolution, size, life);
 
                     if pixel[0] < 0.0 || pixel[0] > size[0] || pixel[1] < 0.0 || pixel[1] > size[1] || particle.loop_count >= life {
-                        *particle = generate_particle(extent, &self.mask_data, self.resolution, self.size);
+                        *particle = generate_particle(extent, &self.mask_data, simple_bounds, self.resolution, self.size);
                     }
 
                     draw_particle(&ctx, particle, extent, resolution, pixel, line_width);
@@ -504,6 +681,8 @@ fn handle_particle(
     let width = size[0];
     let height = size[1];
 
+    let data_bounds = SimpleBounds::from_aabb_point(&rtree.root().envelope());
+
     // 1. 보간을 건너뛰는 경우 처리
     if let Some(avoid_count) = particle.avoid_interpolation_frame_count {
         if avoid_count > 0 {
@@ -513,10 +692,10 @@ fn handle_particle(
 
             let reflected_pixel = to_pixel(particle.coordinate.longitude, particle.coordinate.latitude, extent, resolution);
             if should_reflect_or_detour(particle, mask_data, reflected_pixel, width as usize, height as usize, exaggeration) {
-                update_particle_state(particle, mask_data, extent, resolution, size, life);
+                update_particle_state(particle, mask_data, data_bounds, extent, resolution, size, life);
                 return;
             }
-            update_particle_state(particle, mask_data, extent, resolution, size, life);
+            update_particle_state(particle, mask_data, data_bounds, extent, resolution, size, life);
             return;
         }
     }
@@ -525,19 +704,25 @@ fn handle_particle(
 
     // 2. 반사 또는 우회 여부 확인
     if should_reflect_or_detour(particle, mask_data, pixel, width as usize, height as usize, exaggeration) {
-        update_particle_state(particle, mask_data, extent, resolution, size, life);
+        update_particle_state(particle, mask_data, data_bounds, extent, resolution, size, life);
         return;  // 이미 반사 또는 우회가 이루어졌으면 여기서 종료
     }
 
     // 3. 보간 처리
     let (interpolated_u, interpolated_v) = interpolate_uv(particle, rtree, interpolation_type, mask_data, extent, resolution, size);
+
+    if interpolated_u == 0.0 && interpolated_v == 0.0 {
+        *particle = generate_particle(extent, mask_data, data_bounds, resolution, size);
+        return;
+    }
+
     let new_longitude = particle.coordinate.longitude + interpolated_u * exaggeration;
     let new_latitude = particle.coordinate.latitude + interpolated_v * exaggeration;
     let new_pixel = to_pixel(new_longitude, new_latitude, extent, resolution);
 
     // 4. 보간 처리 후 다시 반사 또는 우회 여부 확인
     if should_reflect_or_detour(particle, mask_data, new_pixel, width as usize, height as usize, exaggeration) {
-        update_particle_state(particle, mask_data, extent, resolution, size, life);
+        update_particle_state(particle, mask_data, data_bounds, extent, resolution, size, life);
         return;  // 이미 반사 또는 우회가 이루어졌으면 여기서 종료
     }
 
@@ -549,13 +734,14 @@ fn handle_particle(
 
     particle.status = 0;
 
-    update_particle_state(particle, mask_data, extent, resolution,size, life);
+    update_particle_state(particle, mask_data, data_bounds, extent, resolution,size, life);
 }
 
 // 파티클 상태 업데이트 함수
 fn update_particle_state(
     particle: &mut Particle,
     mask_data: &Vec<u8>,
+    data_bounds: SimpleBounds,
     extent: SimpleBounds,
     resolution: f64,
     size: [f64; 2],
@@ -569,7 +755,7 @@ fn update_particle_state(
 
     // 파티클이 수명이 다한 경우 다시 생성
     if should_respawn(particle, life) {
-        *particle = generate_particle(extent, mask_data, resolution, size);
+        *particle = generate_particle(extent, mask_data, data_bounds, resolution, size);
     }
 }
 
@@ -680,10 +866,10 @@ fn should_reflect_or_detour(
 ) -> bool {
     let distance_to_land = calculate_distance_to_land(pixel, mask_data, width, height);
     if let Some(distance) = distance_to_land {
-        if distance < 2.0 {
+        if distance < 5.0 {
             particle.status = 3;
            return true;
-        }  else if distance < 5.0 {
+        }  /*else if distance < 5.0 {
             // 매우 가까운 경우 반사
             handle_reflection(particle, pixel, mask_data, width, height, exaggeration);
             return true;
@@ -691,7 +877,7 @@ fn should_reflect_or_detour(
             // 가까운 경우 우회
             detour_around_land(particle, pixel, mask_data, width, height, exaggeration);
             return true;
-        }
+        }*/
     }
 
     false
@@ -865,88 +1051,109 @@ fn draw_vector (ctx: &CanvasRenderingContext2d, point:WeatherData, extent:Simple
     let coordinate = point.coordinate;
     let lon = coordinate.longitude;
     let lat = coordinate.latitude;
-    let u = point.udata;
-    let v = point.vdata;
     let pixel = to_pixel(lon, lat, extent, resolution);
 
-    let rotate = /*(std::f64::consts::PI)*/ - v.atan2(u);
-    let speed = (u * u + v * v).sqrt();
-
-    /*let color = calculate_color_from_speed_lerp(speed);*/
-    let color = calculate_color_from_speed(speed);
-
-    let dpi =  96.0; // 일반적으로 96dpi로 계산
-    let pixels_per_cm = dpi / 2.54; // 1cm에 해당하는 픽셀 수
-    let arrow_length = speed  * pixels_per_cm;
-    let arrow_head_size = (speed * 10.0).clamp(1.5, 10.0);   // 머리 고정 크기
-    let half_width = 2.5;  // 몸통 고정 너비
-    let arrow_tail_length =  (arrow_length - arrow_head_size).max(0.0);
+    let rotate = point.rotate();
+    let speed = point.speed();
 
     ctx.save();
-    ctx.set_fill_style(&JsValue::from_str(&color));
 
     ctx.translate(pixel[0], pixel[1]).expect("ctx translate failed");
-    ctx.rotate(rotate).expect("ctx rotate failed");
-
-    draw_arrow(&ctx, arrow_tail_length, arrow_head_size, half_width).expect("draw arrow failed");
+    ctx.rotate(- (std::f64::consts::PI / 2.0) + rotate).expect("ctx rotate failed");
+    draw_arrow(&ctx, speed).expect("draw arrow failed");
 
     ctx.restore();
+
+    //draw_debug_vector(ctx, point.udata, point.vdata, lon, lat, pixel[0], pixel[1]);
+}
+
+fn draw_arrow(ctx: &CanvasRenderingContext2d, speed:f64,) -> Result<(), JsValue> {
+    let dpi =  96.0; // 일반적으로 96dpi로 계산
+    let pixels_per_cm = dpi / 2.54; // 1cm에 해당하는 픽셀 수
+    let arrow_length = (speed  * pixels_per_cm).min(pixels_per_cm * 1.5);
+
+    let arrow_head_size = 4.0/*(5.0 / speed).clamp(1.5, 10.0)*/;   // 머리 고정 크기
+    let offset = arrow_length / 2.0 - 2.0;
+    let half_width = 3.0;  // 몸통 고정 너비
+    let arrow_tail_length =  (arrow_length - arrow_head_size).max(0.0);
+
+    let width = half_width * 2.0;
+    let curve_radius = 1.25;
+    let adjusted_tail_length = arrow_tail_length - curve_radius;
+
+    let gradient = ctx.create_linear_gradient(0.0, 0.0, -adjusted_tail_length, 0.0);
+    gradient.add_color_stop(0.0, &*calculate_color_from_speed(speed, 1.0));
+    gradient.add_color_stop(1.0, &*calculate_color_from_speed(speed, calculate_alpha_from_speed(speed)));
+
+    ctx.set_fill_style(&gradient.into());
+    ctx.set_stroke_style(&JsValue::from_str("#EAEAEA"));
+    ctx.set_line_width(0.6);
+
+    // 화살표 꼬리 (직사각형)
+    ctx.begin_path();
+    ctx.move_to(0.0 + offset, -width*(1.2 / speed).clamp(1.2, 1.8)); // 머리 좌측
+    ctx.line_to(arrow_head_size + offset, 0.0); // 머리 끝점 (삼각형 끝, 가운데)
+    ctx.line_to(0.0 + offset, width*(1.2 / speed).clamp(1.2, 1.8)); // 머리 우측
+    ctx.line_to(0.0 + offset, half_width); // 몸통 아래쪽 (머리와 연결)
+    ctx.line_to(-adjusted_tail_length + offset, half_width); // 몸통 아래쪽 끝
+
+    // 몸통과 곡선 연결
+    ctx.quadratic_curve_to(
+        -adjusted_tail_length - curve_radius + offset, // 제어점 X
+        0.0,                                  // 제어점 Y
+        -adjusted_tail_length + offset,                // 몸통 위쪽 끝 X
+        -half_width,                          // 몸통 위쪽 끝 Y
+    );
+
+    // 화살표 머리로 다시 연결
+    ctx.line_to(0.0 + offset, -half_width); // 몸통 위쪽 (머리와 연결)
+
+    ctx.close_path();
+    ctx.fill();
+    ctx.stroke();
+
+    Ok(())
 }
 
 fn draw_debug_vector(ctx: &CanvasRenderingContext2d, u:f64, v:f64, lon:f64, lat:f64, x:f64, y:f64) -> Result<(), JsValue> {
+    ctx.set_text_align("center");
     let rotate = /*(std::f64::consts::PI / 2.0) - */v.atan2(u);
     let speed = (u * u + v * v).sqrt();
 
     let wgs84 = web_mercator_to_wgs84(lon, lat);
 
-    let location_text = format!("Longitude: {:.2}, Latitude: {:.2}", wgs84.longitude, wgs84.latitude);
+    /*let location_text = format!("Longitude: {:.2}, Latitude: {:.2}", wgs84.longitude, wgs84.latitude);
     ctx.set_font("11px Arial");
     ctx.set_fill_style(&JsValue::from_str("black"));
-    ctx.fill_text(&location_text, x, y)?;
+    ctx.fill_text(&location_text, x, y)?;*/
 
     // 회전 및 속도 출력
-    let rotation_speed_text = format!("Rotation: {:.2}° Speed: {:.2}", rotate.to_degrees(), speed);
+    let rotation_speed_text = format!("Rotation rad: {:.2} Rotation Deg: {:.2}° Speed: {:.2}",rotate, rotate.to_degrees(), speed);
     ctx.fill_text(&rotation_speed_text, x, y + 10.0)?;
 
     Ok(())
 }
 
-fn draw_arrow(ctx: &CanvasRenderingContext2d, tail_length: f64, head_size: f64, half_width: f64) -> Result<(), JsValue> {
-    let width = half_width * 2.0;
-    let curve_radius = 1.25;
-    let adjusted_tail_length = tail_length - curve_radius;
-    // 화살표 꼬리 (직사각형)
-    ctx.begin_path();
-    ctx.move_to(0.0, -width); // 머리 좌측
-    ctx.line_to(head_size, 0.0); // 머리 끝점 (삼각형 끝, 가운데)
-    ctx.line_to(0.0, width); // 머리 우측
-    ctx.close_path();
-    ctx.fill();
-
-    // 화살표 몸통 (직사각형)
-    ctx.begin_path();
-    ctx.move_to(0.0, -half_width); // 몸통 위쪽 (머리와 연결)
-    ctx.line_to(-adjusted_tail_length, -half_width); // 몸통 위쪽 끝
-
-    ctx.quadratic_curve_to(-adjusted_tail_length - curve_radius, // 제어점 X
-                           0.0, // 제어점 Y
-                           -adjusted_tail_length, // 끝점 X
-                           half_width,);
-    /*ctx.line_to(-tail_length, half_width); // 몸통 아래쪽 끝*/
-    ctx.line_to(0.0, half_width); // 몸통 아래쪽 (머리와 연결)
-    ctx.close_path();
-    ctx.fill();
-
-    Ok(())
+fn calculate_color_from_speed(speed: f64, alpha: f64) -> String {
+    match speed {
+        0.0..=0.26 => format!("rgba(127, 0, 127, {})", alpha),   // 보라색
+        0.26..=0.51 => format!("rgba(3, 3, 202, {})", alpha),    // 파란색
+        0.51..=0.76 => format!("rgba(0, 93, 0, {})", alpha),     // 초록색
+        0.76..=1.01 => format!("rgba(233, 88, 0, {})", alpha),   // 주황색
+        _ => format!("rgba(192, 0, 0, {})", alpha),              // 빨간색 (1.01 이상)
+    }
 }
 
-fn calculate_color_from_speed(speed: f64) -> String {
-    match speed {
-        0.0..=0.26 => "#7F007F".to_string(),   // 보라색
-        0.26..=0.51 => "#0303CA".to_string(),  // 파란색
-        0.51..=0.76 => "#005D00".to_string(),  // 초록색
-        0.76..=1.01 => "#E95800".to_string(),  // 주황색
-        _ => "#C00000".to_string(),            // 빨간색 (1.01 이상)
+fn calculate_alpha_from_speed(speed: f64) -> f64 {
+    let min_alpha = 0.5;
+    let max_alpha = 1.0;
+    let threshold_speed = 0.26;
+
+    if speed <= threshold_speed {
+        max_alpha // 속도가 threshold_speed 이하일 때는 알파값을 1.0에 가깝게 유지
+    } else {
+        // 속도가 threshold_speed를 넘을 때 점차 알파값을 줄임 (0.3까지)
+        max_alpha - (speed - threshold_speed) / (1.01 - threshold_speed) * (max_alpha - min_alpha)
     }
 }
 
@@ -975,23 +1182,27 @@ fn calculate_color_from_speed_lerp(speed: f64, alpha:Option<f64>) -> String {
         lerp_color((233, 88, 0), (192, 0, 0), (speed - 0.76) / (1.01 - 0.76), alpha)
     } else {
         // 빨간색
-        "#C00000".to_string()
+        lerp_color((192, 0, 0), (192, 0, 0), 1.0, alpha)
     }
 }
 
-fn initialize_data(data: JsValue, mask_data:&Vec<u8>, extent: SimpleBounds, resolution: f64, size:[f64;2], particle_count: Option<usize>) -> (RTree<WeatherData>, SimpleBounds, Option<Vec<Particle>>) {
+fn initialize_data(data_array: Vec<(f64,f64,f64,f64)>, mask_data:&Vec<u8>, extent: SimpleBounds, resolution: f64, size:[f64;2], particle_count: Option<usize>) -> (RTree<WeatherData>, SimpleBounds, Option<Vec<Particle>>) {
     let mut rtree = RTree::new();
-    let data_array = js_sys::Array::from(&data);
+    //log!("데이터 추출 전");
     let _ = for data in data_array.iter() {
+        //log!("data {:?}", data);
         // 각 item이 객체라고 가정하고 필요한 필드를 추출
-        let longitude = Reflect::get(&data, &JsValue::from_str("longitude")).ok().unwrap().as_f64().unwrap();
+        let longitude = data.0; //Reflect::get(&data, &JsValue::from_str("longitude")).ok().unwrap().as_f64().unwrap();
 
-        let latitude = Reflect::get(&data, &JsValue::from_str("latitude")).ok().unwrap().as_f64().unwrap();
-        let udata = Reflect::get(&data, &JsValue::from_str("udata")).ok().unwrap().as_f64().unwrap();
-        let vdata = Reflect::get(&data, &JsValue::from_str("vdata")).ok().unwrap().as_f64().unwrap();
+        let latitude = data.1;// Reflect::get(&data, &JsValue::from_str("latitude")).ok().unwrap().as_f64().unwrap();
+        let udata = data.2;// Reflect::get(&data, &JsValue::from_str("udata")).ok().unwrap().as_f64().unwrap();
+        let vdata = data.3;// Reflect::get(&data, &JsValue::from_str("vdata")).ok().unwrap().as_f64().unwrap();
+
+        //log!("longitude {:?}, latitude {:?}, udata {:?}, vdata {:?}", longitude, latitude, udata, vdata);
         let coord = wgs84_to_web_mercator(longitude, latitude);
         let pixel = to_pixel(coord.longitude, coord.latitude, extent, resolution);
 
+        //log!("coord {:?}, pixel {:?}", coord, pixel);
         if !is_masked(pixel, mask_data, size[0], size[1]) {
             let wd = WeatherData {
                 coordinate: coord,
@@ -1001,13 +1212,13 @@ fn initialize_data(data: JsValue, mask_data:&Vec<u8>, extent: SimpleBounds, reso
             rtree.insert(wd);
         }
     };
-
+    //log!("데이터 추출 종료");
     let bounds = rtree.root().envelope();
 
     let simple_bounds = SimpleBounds::from_aabb_point(&bounds);
-
+    //log!("바운드 생성");
     let particles = if let Some(particle_count) = particle_count {
-        Some(generate_particles(extent, particle_count, mask_data, resolution, size))
+        Some(generate_particles(extent, particle_count, mask_data, simple_bounds, resolution, size))
     } else {
         None
     };
@@ -1015,26 +1226,25 @@ fn initialize_data(data: JsValue, mask_data:&Vec<u8>, extent: SimpleBounds, reso
     (rtree, simple_bounds, particles)
 }
 
-
-fn generate_particles(extent:SimpleBounds,num_particles: usize,mask_data:&Vec<u8>, resolution: f64, size:[f64;2]) -> Vec<Particle> {
+fn generate_particles(extent:SimpleBounds,num_particles: usize,mask_data:&Vec<u8>, data_bounds:SimpleBounds, resolution: f64, size:[f64;2]) -> Vec<Particle> {
     let mut particles = Vec::new();
     for _ in 0..num_particles {
-        particles.push(generate_particle(extent,mask_data, resolution, size));
+        particles.push(generate_particle(extent,mask_data, data_bounds, resolution, size));
     }
 
     particles
 }
 
-fn generate_particle(extent:SimpleBounds, mask_data:&Vec<u8>, resolution: f64, size:[f64;2]) -> Particle {
+fn generate_particle(extent:SimpleBounds, mask_data:&Vec<u8>, data_bounds:SimpleBounds, resolution: f64, size:[f64;2]) -> Particle {
     loop {
         let width = size[0];
         let height = size[1];
+
         let (x, y) = generate_random_pixel(width as usize, height as usize);
+        let [longitude, latitude] = to_coord([x as f64, y as f64], extent, resolution);
+        let coordinate = Coordinate { longitude, latitude};
 
-        if !is_masked([x as f64, y as f64], mask_data, width, height) {
-            let [longitude, latitude] = to_coord([x as f64, y as f64], extent, resolution);
-            let coordinate = Coordinate { longitude, latitude};
-
+        if !is_masked([x as f64, y as f64], mask_data, width, height) && data_bounds.containsCoordinate(coordinate) {
             return Particle {
                 coordinate,
                 original_coordinate: coordinate,
