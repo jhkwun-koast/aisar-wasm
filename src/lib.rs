@@ -77,17 +77,71 @@ pub struct DrawCurrentFlowCanvasOption {
 }
 
 // 동적 파티클 수 관리 상수
-const TARGET_SPACING: f64 = 50.0;
+// 25px(=CELL_SIZE와 다시 일치하지 않는 값)로 낮춰 셀당 목표 입자수(particles_per_cell,
+// adjust_particle_count_gradual 참고)를 1→4로 올렸다 — 예전엔 50이었는데 그 값으로는
+// 셀당 1개뿐이라 저줌(화면 대비 메시 폭이 좁아짐)에서 유효 셀 수 자체가 줄어드는 것과
+// 겹쳐 눈에 띄게 희소해 보였다(2026-08 사용자 피드백 — "줌레벨 5 인근에서 입자 생성 안
+// 되는 부분이 너무 많음"). 아래 particles_per_cell 계산에 쓰이는 "// = 4" 주석이 이미
+// 25px 기준으로 쓰여 있었다 — 과거 어느 시점엔 25였다가 50으로 바뀌면서 주석만 안
+// 맞춰진 상태였다.
+const TARGET_SPACING: f64 = 25.0;
 const MIN_PARTICLES: usize = 1000;
+// density_multiplier(JS에서 set_density_multiplier로 실시간 조절, 기본 1.0)가 곱해진 뒤의
+// 절대 상한 — 기존 MAX_PARTICLES=5000은 multiplier=1일 때의 실질 상한 역할을 하고, 이
+// 값은 multiplier를 올렸을 때 실제로 늘어날 수 있는 여유(헤드룸)다. 2026-08 사용자 요청
+// ("입자수도 슬라이더로") — windy.com 수준의 밀도를 내려면 기존 5000 상한 자체가
+// 병목이었다.
 const MAX_PARTICLES: usize = 5000;
+const MAX_PARTICLES_ABS: usize = 20000;
 const TRANSITION_RATE: usize = 100;
+
+// 2026-08 사용자 피드백("입자수도 [줌 레벨에 따라 달라져야]") — exaggeration을 extentWidth에
+// 정비례시킨 것과 같은 이유로 시작했다. valid_cells(아래 adjust_particle_count_gradual)는
+// 화면 픽셀 그리드 기준이라 줌과 무관하게 거의 일정한데, 실제로 보이는 바다 면적은 저줌일수록
+// 넓다. 처음엔 면적(extentWidth²)에 정비례시켰더니 저줌에서 "아무리 저줌이라도 너무 많음"
+// 피드백 — 인간이 지각하는 "빽빽함"은 실제 면적 비율만큼 늘어날 필요가 없다는 뜻이다.
+// 선형(제곱 아님)으로 완화하고 상한/하한을 좁게 클램프해 과밀·과소 둘 다 막는다. 400km를
+// 1배 기준으로 둔다(density_multiplier 도입 이전부터 기존 밀도가 "적당하다"고 검증돼 온
+// 지점 — FLOW_EXAG_SCALE의 기준점과 동일).
+const DENSITY_REF_EXTENT: f64 = 400_000.0;
+const DENSITY_ZOOM_SCALE_MIN: f64 = 0.4;
+const DENSITY_ZOOM_SCALE_MAX: f64 = 1.6;
 
 // 셀 격자 크기 (픽셀)
 const CELL_SIZE: f64 = 50.0;
-// 셀당 최대 파티클 수 (밀도 rejection 상한)
-const MAX_PARTICLES_PER_CELL: u32 = 5;
+// 셀당 최대 파티클 수 (밀도 rejection 상한). TARGET_SPACING 조정으로 셀당 목표가 1→4로
+// 올라간 만큼 이 값도 비례해서 올린다(목표 대비 여유 배율은 기존과 비슷하게 유지).
+const MAX_PARTICLES_PER_CELL: u32 = 16;
 // 프레임당 최대 spawn 수 (블로킹 방지)
 const MAX_SPAWNS_PER_FRAME: usize = 50;
+
+// 유속 → 화면 이동거리 매핑을 정비례(y=kx)가 아니라 최소값이 있는 1차식(y=floor+kx)으로
+// 바꾼다. 유속이 0에 가까운 구간(정조·약한 와류)에서는 이동거리가 사실상 0에 수렴해
+// 렌더러의 최소 세그먼트 stretch로도 못 살리는 점으로 남았다가, should_respawn(0.001
+// 임계값)에 걸려 매 프레임 리스폰되며 반짝이는 "폭죽" 현상(2026-08 사용자 피드백)이 나던
+// 원인이다. 방향은 그대로 두고 크기만 바닥값을 보장한다 — windy.com도 정지에 가까운
+// 해역을 완전한 정지가 아니라 옅은 흐름감으로 표현한다.
+// 2026-08 사용자 피드백("floor 더 높이고 slope는 줄여야함 (windy)") 반영 — windy는 유속
+// 차이를 "이동 속도"보다 "색"으로 더 많이 전달한다. floor를 올려 정지에 가까운 구간의
+// 기본 흐름감을 더 강하게 보장하고, slope를 낮춰 빠른 해역이 과도하게 빨리 흐르지 않게
+// 다이나믹 레인지를 압축한다.
+// CurrentFlowWrapper.speed_floor/speed_slope의 생성자 초기값(2026-08 UI 슬라이더로 런타임
+// 조절 가능해짐 — set_speed_floor/set_speed_slope 참고). 값 자체의 근거는 아래 주석대로다.
+const DEFAULT_FLOW_SPEED_FLOOR: f64 = 0.12; // m/s
+const DEFAULT_FLOW_SPEED_SLOPE: f64 = 0.5;
+
+/// 실측 유속(u,v)을 그대로 반환하지 않고, 방향은 보존한 채 크기만 바닥값 이상으로 끌어올린다.
+/// current_u/current_v(색상 버킷·리스폰 판정에 쓰는 실측 유속)에는 적용하지 않고, 화면 이동
+/// 계산(exaggeration 곱셈 입력)에만 이 함수의 결과를 쓴다.
+fn apply_flow_speed_floor(u: f64, v: f64, floor: f64, slope: f64) -> (f64, f64) {
+    let speed = (u * u + v * v).sqrt();
+    if speed < 1e-9 {
+        return (u, v);
+    }
+    let effective_speed = floor + slope * speed;
+    let scale = effective_speed / speed;
+    (u * scale, v * scale)
+}
 
 /// 뷰포트 내 visible 삼각형 캐시 (R-tree 반복 쿼리 제거)
 /// viewport 변경 시 1회 빌드, spawn 시 binary search로 O(log N) 선택
@@ -768,6 +822,15 @@ pub struct CurrentFlowWrapper {
 
     // 산술 PRNG (crypto.getRandomValues 대체)
     rng: Xoshiro256PlusPlus,
+
+    // 목표 파티클 수 배율(기본 1.0) — set_density_multiplier로 런타임에 조절 가능.
+    // adjust_particle_count_gradual()이 매 프레임 이 값을 반영해 점진적으로 수렴한다.
+    density_multiplier: f64,
+
+    // 유속→변위 매핑 y=speed_floor+speed_slope*speed (apply_flow_speed_floor 참고) —
+    // set_speed_floor/set_speed_slope로 런타임 조절 가능(2026-08).
+    speed_floor: f64,
+    speed_slope: f64,
 }
 
 #[wasm_bindgen]
@@ -838,6 +901,9 @@ impl CurrentFlowWrapper {
             mesh_cell_mask: None,
             visible_tri_cache: None,
             rng,
+            density_multiplier: 1.0,
+            speed_floor: DEFAULT_FLOW_SPEED_FLOOR,
+            speed_slope: DEFAULT_FLOW_SPEED_SLOPE,
         }
     }
 
@@ -875,6 +941,25 @@ impl CurrentFlowWrapper {
         self.exaggeration = value;
     }
 
+    /// 목표 파티클 수 배율(실험용, 기본 1.0) — 0.1~4.0 권장 범위로 clamp한다.
+    /// 즉시 반영되지 않고 adjust_particle_count_gradual()이 매 프레임 TRANSITION_RATE만큼
+    /// 점진적으로 늘리거나 줄인다(급격한 변화로 인한 프레임 드랍 방지, 기존 설계 그대로).
+    pub fn set_density_multiplier(&mut self, value: f64) {
+        self.density_multiplier = value.clamp(0.1, 4.0);
+    }
+
+    /// 유속→변위 매핑 y=floor+slope*speed의 floor(실험용, 기본 0.12 m/s) — apply_flow_speed_floor
+    /// 참고. 음수는 의미가 없어(방향 반전 유발) 0 이상으로 clamp한다.
+    pub fn set_speed_floor(&mut self, value: f64) {
+        self.speed_floor = value.max(0.0);
+    }
+
+    /// 유속→변위 매핑 y=floor+slope*speed의 slope(실험용, 기본 0.5) — apply_flow_speed_floor
+    /// 참고. 음수는 의미가 없어(속도가 커질수록 화면 이동이 줄어듦) 0 이상으로 clamp한다.
+    pub fn set_speed_slope(&mut self, value: f64) {
+        self.speed_slope = value.max(0.0);
+    }
+
     pub fn reset_particles(&mut self) {
         // 모든 파티클 life = 0 → 다음 프레임에 전부 리스폰
         for p in &mut self.particles {
@@ -895,6 +980,24 @@ impl CurrentFlowWrapper {
             max_x: ext[2],
             max_y: ext[3],
         };
+
+        // 줌아웃 감지(뷰포트 지리적 폭이 크게 넓어짐) 시 기존 파티클을 전부 비운다.
+        // 이전(좁은) 화면의 파티클들은 새로 넓어진 화면 안에 그대로 남아있어(화면 밖으로
+        // 나간 게 아니므로 migrate_particles_to_viewport가 감지 못함) — 자연 리스폰
+        // (spawn_particle_near, 죽은 자리 근처)만으로는 계속 같은 자리 근처에서만
+        // 다시 스폰돼 "방금 보던 구역에 파티클이 뭉쳐 보이는" 현상이 생긴다(2026-08 발견).
+        // particles를 비우면 다음 프레임 adjust_particle_count_gradual()의 증가 경로가
+        // spawn_balanced_particle(뷰포트 전체 면적 가중 무작위)로 다시 채워 넓어진 화면
+        // 전체에 고르게 재분포된다 — TRANSITION_RATE만큼씩 점진적으로 채워지므로 순간적으로
+        // 텅 비었다 서서히 차오르는 정도로만 보인다.
+        if let Some(ref old_vp) = self.viewport {
+            let old_width = old_vp.extent.max_x - old_vp.extent.min_x;
+            let new_width = bounds.max_x - bounds.min_x;
+            if old_width > 0.0 && new_width > old_width * 1.2 {
+                self.particles.clear();
+            }
+        }
+
         self.viewport = Some(Viewport::new(canvas_w, canvas_h, bounds));
         self.mesh_cell_mask = None; // 뷰포트 변경 시 마스크 무효화
         self.visible_tri_cache = None; // 뷰포트 변경 시 삼각형 캐시 무효화
@@ -983,30 +1086,49 @@ impl CurrentFlowWrapper {
             .map(|m| m.iter().filter(|&&v| v).count())
             .unwrap_or(viewport.grid_cols * viewport.grid_rows);
 
+        let extent_width = viewport.extent.max_x - viewport.extent.min_x;
+        let zoom_area_scale = (extent_width / DENSITY_REF_EXTENT).clamp(DENSITY_ZOOM_SCALE_MIN, DENSITY_ZOOM_SCALE_MAX);
+        // 줌(면적)과 density_multiplier를 곱한 총 배율 — transition_rate/max_per_cell을 얼마나
+        // 함께 늘려야 목표치에 실제로 도달하는지 결정한다. 둘 다 1배 아래(줌인/배율<1)일 때는
+        // 기존 속도를 유지한다(줄어드는 쪽은 서두를 필요 없음).
+        let density_scale = (zoom_area_scale * self.density_multiplier).max(1.0);
+
         let target = if valid_cells == 0 {
             0
         } else {
             let particles_per_cell = (CELL_SIZE / TARGET_SPACING).powi(2) as usize; // = 4
-            (valid_cells * particles_per_cell).min(MAX_PARTICLES)
-        };
+            let base = (valid_cells * particles_per_cell).min(MAX_PARTICLES);
+            // density_multiplier가 1.0을 넘으면 기존 MAX_PARTICLES(=multiplier 1.0 기준 상한)
+            // 위로 더 늘어날 수 있다 — MAX_PARTICLES_ABS가 그 여유의 절대 한계다.
+            let scaled = ((base as f64) * zoom_area_scale * self.density_multiplier).round() as usize;
+            // zoom_area_scale이 1배 미만(고줌)일 때 목표가 MIN_PARTICLES 아래로 꺼지지 않게 한다
+            // — 예전엔 줌이 target을 줄인 적이 없어 이 바닥값이 이 함수에서 쓰인 적이 없었다.
+            scaled.max(MIN_PARTICLES)
+        }.min(MAX_PARTICLES_ABS);
 
         let current = self.particles.len();
+        // 밀도를 크게 올린 직후에도 목표에 도달하는 시간이 비슷하게 유지되도록
+        // TRANSITION_RATE도 배율만큼 함께 늘린다(배율을 낮출 때는 원래 속도 유지).
+        let transition_rate = ((TRANSITION_RATE as f64) * density_scale).round() as usize;
+        // 셀당 밀도 상한도 배율에 맞춰 올려야 목표치까지 실제로 채워진다 — 안 그러면
+        // 상한이 낮아 spawn_balanced_particle이 계속 밀도 초과로 거부하고 목표에 못 미친다.
+        let max_per_cell = ((MAX_PARTICLES_PER_CELL as f64) * density_scale).round() as u32;
 
         if current < target {
-            let to_add = (target - current).min(TRANSITION_RATE);
+            let to_add = (target - current).min(transition_rate);
             if let (Some(_rtree), Some(_mb), Some(ref cache)) = (&self.tri_rtree, &self.mesh_bounds, &self.visible_tri_cache) {
                 let life = self.life;
                 let nodes = &self.mesh_nodes;
                 let mut cell_counts = build_cell_counts(&self.particles, &viewport);
                 let rng = &mut self.rng;
                 for _ in 0..to_add {
-                    if let Some(p) = spawn_balanced_particle(&viewport, cache, nodes, life, &mut cell_counts, MAX_PARTICLES_PER_CELL, rng) {
+                    if let Some(p) = spawn_balanced_particle(&viewport, cache, nodes, life, &mut cell_counts, max_per_cell, rng) {
                         self.particles.push(p);
                     }
                 }
             }
         } else if current > target {
-            let to_remove = (current - target).min(TRANSITION_RATE);
+            let to_remove = (current - target).min(transition_rate);
             remove_shortest_lived(&mut self.particles, to_remove);
         }
     }
@@ -1160,6 +1282,8 @@ impl CurrentFlowWrapper {
         let life = self.life;
         let prev_count = self.prev_count;
         let exaggeration = self.exaggeration;
+        let speed_floor = self.speed_floor;
+        let speed_slope = self.speed_slope;
 
         let rtree = self.tri_rtree.as_ref().unwrap();
         let nodes = &self.mesh_nodes;
@@ -1176,6 +1300,16 @@ impl CurrentFlowWrapper {
         };
 
         let rng = &mut self.rng;
+        // adjust_particle_count_gradual()과 동일 공식(줌 면적 배율 포함) — 안 맞추면 저줌에서
+        // 목표 개체수는 올라갔는데 셀당 상한이 예전 그대로라 자연 리스폰이 계속 상한에 막혀
+        // 목표에 도달하지 못한다.
+        let density_scale = if let Some(ref vp) = self.viewport {
+            let extent_width = vp.extent.max_x - vp.extent.min_x;
+            ((extent_width / DENSITY_REF_EXTENT).clamp(DENSITY_ZOOM_SCALE_MIN, DENSITY_ZOOM_SCALE_MAX) * self.density_multiplier).max(1.0)
+        } else {
+            self.density_multiplier.max(1.0)
+        };
+        let max_per_cell = ((MAX_PARTICLES_PER_CELL as f64) * density_scale).round() as u32;
 
         // viewport 있으면 40B × N 고정 크기, 없으면 가변
         if has_viewport {
@@ -1214,9 +1348,11 @@ impl CurrentFlowWrapper {
             }
 
             for particle in self.particles.iter_mut() {
-                // Deferred respawn: 이전 프레임에서 RESPAWN 마킹된 파티클 처리
+                // Deferred respawn: 이전 프레임에서 RESPAWN 마킹된 파티클 처리.
+                // 죽은 자리(head) 근처에서 새 파티클을 스폰해 흐름선이 끊기지 않고 이어지는
+                // 느낌을 준다(windy.com 벤치마크, 2026-08) — spawn_particle_near 참고.
                 if particle.status == ParticleStatus::RESPAWN {
-                    if let Some(new_p) = spawn_balanced_particle(vp, cache, nodes, life, &mut cell_counts, MAX_PARTICLES_PER_CELL, rng) {
+                    if let Some(new_p) = spawn_particle_near(particle.coordinate.longitude, particle.coordinate.latitude, vp, rtree, cache, nodes, life, &mut cell_counts, max_per_cell, rng) {
                         *particle = new_p;
                     }
                     // None이면 그대로 둠 (극히 드문 경우, 다음 프레임에 재시도)
@@ -1232,16 +1368,17 @@ impl CurrentFlowWrapper {
                     Some((u, v)) => {
                         const EPSILON: f64 = 1e-10;
                         if u.abs() < EPSILON && v.abs() < EPSILON {
-                            // 유속이 0에 가까우면 → 삼각형 기반 균등 리스폰
-                            if let Some(new_p) = spawn_balanced_particle(vp, cache, nodes, life, &mut cell_counts, MAX_PARTICLES_PER_CELL, rng) {
+                            // 유속이 0에 가까우면 → 죽은 자리 근처에서 리스폰
+                            if let Some(new_p) = spawn_particle_near(x, y, vp, rtree, cache, nodes, life, &mut cell_counts, max_per_cell, rng) {
                                 *particle = new_p;
                             }
                         } else {
                             // Mercator 보정: Web Mercator 등각도법 — X, Y 모두 1/cos(φ) 적용
                             let lat_rad = 2.0 * (particle.coordinate.latitude * std::f64::consts::PI / 20037508.34).exp().atan() - std::f64::consts::FRAC_PI_2;
                             let cos_lat = lat_rad.cos();
-                            particle.coordinate.longitude += u * exaggeration / cos_lat;
-                            particle.coordinate.latitude += v * exaggeration / cos_lat;
+                            let (eff_u, eff_v) = apply_flow_speed_floor(u, v, speed_floor, speed_slope);
+                            particle.coordinate.longitude += eff_u * exaggeration / cos_lat;
+                            particle.coordinate.latitude += eff_v * exaggeration / cos_lat;
                             particle.current_u = u;
                             particle.current_v = v;
                             particle.status = ParticleStatus::OK;
@@ -1261,8 +1398,8 @@ impl CurrentFlowWrapper {
                         }
                     }
                     None => {
-                        // 삼각형 밖 → 삼각형 기반 균등 리스폰
-                        if let Some(new_p) = spawn_balanced_particle(vp, cache, nodes, life, &mut cell_counts, MAX_PARTICLES_PER_CELL, rng) {
+                        // 삼각형 밖 → 죽은 자리 근처에서 리스폰
+                        if let Some(new_p) = spawn_particle_near(x, y, vp, rtree, cache, nodes, life, &mut cell_counts, max_per_cell, rng) {
                             *particle = new_p;
                         }
                     }
@@ -1292,8 +1429,9 @@ impl CurrentFlowWrapper {
                             // Mercator 보정: Web Mercator 등각도법 — X, Y 모두 1/cos(φ) 적용
                             let lat_rad = 2.0 * (particle.coordinate.latitude * std::f64::consts::PI / 20037508.34).exp().atan() - std::f64::consts::FRAC_PI_2;
                             let cos_lat = lat_rad.cos();
-                            particle.coordinate.longitude += u * exaggeration / cos_lat;
-                            particle.coordinate.latitude += v * exaggeration / cos_lat;
+                            let (eff_u, eff_v) = apply_flow_speed_floor(u, v, speed_floor, speed_slope);
+                            particle.coordinate.longitude += eff_u * exaggeration / cos_lat;
+                            particle.coordinate.latitude += eff_v * exaggeration / cos_lat;
                             particle.current_u = u;
                             particle.current_v = v;
                             particle.status = ParticleStatus::OK;
@@ -2411,6 +2549,69 @@ fn spawn_in_random_triangle_viewport(
         life: random_within_percent(life, rng),
         prev_coordinate: coordinate,
     })
+}
+
+/// 파티클이 죽은 자리(head) 근처에서 새 파티클을 스폰한다 — windy.com처럼 흐름선이 끊기지
+/// 않고 이어지는 느낌을 준다(2026-08 사용자 요청). 죽은 위치가 속한 셀 → 8-인접 셀 순으로
+/// 시도하며, 각 셀에서 시도 전 밀도 상한(max_per_cell)을 먼저 확인한다 — 정체 수역에서 같은
+/// 자리에 계속 스폰돼 쌓이는 것을 막는 기존 안전장치(spawn_balanced_particle과 동일 원칙)를
+/// 그대로 지킨다. 죽은 위치가 뷰포트 밖이거나 주변 9칸이 모두 막혀 있으면(육지에 둘러싸이거나
+/// 밀도 초과) spawn_balanced_particle(뷰포트 전체 균등 스폰)로 폴백한다.
+///
+/// 매 자연사마다 항상 "죽은 자리 근처"만 시도하면 밀도가 스스로를 강화하는 양의 되먹임이
+/// 생긴다(2026-08 발견 — "화면을 계속 켜놓으면 입자가 나오는 데만 많이 나오고 안 나오는
+/// 데는 점점 안 나오게 됨"): 밀도가 조금이라도 높은 지역은 초당 자연사(죽음) 횟수도
+/// 비례해서 많아지고, 그 죽음이 전부 "근처 재생성"으로 이어지니 이미 밀집된 곳이 계속 더
+/// 밀집되고 성긴 곳은 계속 성긴 채로 남는다. NEAR_HEAD_RESPAWN_CHANCE 확률로만 "근처"를
+/// 시도하고, 나머지는 처음부터 spawn_balanced_particle(뷰포트 전체 면적 가중 무작위)로
+/// 보내 밀도를 지속적으로 평탄화하는 힘을 항상 섞어 넣는다.
+const NEAR_HEAD_RESPAWN_CHANCE: f64 = 0.5;
+
+fn spawn_particle_near(
+    anchor_lon: f64,
+    anchor_lat: f64,
+    viewport: &Viewport,
+    rtree: &RTree<TriangleRef>,
+    cache: &VisibleTriangleCache,
+    nodes: &[MeshNode],
+    life: i16,
+    counts: &mut Vec<u32>,
+    max_per_cell: u32,
+    rng: &mut Xoshiro256PlusPlus,
+) -> Option<Particle> {
+    if !rng.gen_bool(NEAR_HEAD_RESPAWN_CHANCE) {
+        return spawn_balanced_particle(viewport, cache, nodes, life, counts, max_per_cell, rng);
+    }
+
+    let (sx, sy) = viewport.geo_to_screen(anchor_lon, anchor_lat);
+    if sx < 0.0 || sx >= viewport.canvas_w || sy < 0.0 || sy >= viewport.canvas_h {
+        return spawn_balanced_particle(viewport, cache, nodes, life, counts, max_per_cell, rng);
+    }
+    let (col, row) = viewport.screen_to_cell(sx, sy);
+
+    const NEIGHBOR_RING: [(isize, isize); 9] =
+        [(0, 0), (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)];
+
+    for (dc, dr) in NEIGHBOR_RING {
+        let nc = col as isize + dc;
+        let nr = row as isize + dr;
+        if nc < 0 || nr < 0 || nc >= viewport.grid_cols as isize || nr >= viewport.grid_rows as isize {
+            continue;
+        }
+        let nc = nc as usize;
+        let nr = nr as usize;
+        let idx = nr * viewport.grid_cols + nc;
+        if idx >= counts.len() || counts[idx] >= max_per_cell {
+            continue; // 밀도 상한 초과 셀은 건너뛴다
+        }
+        if let Some(p) = try_spawn_in_cell(nc, nr, viewport, rtree, nodes, life, rng) {
+            counts[idx] += 1;
+            return Some(p);
+        }
+    }
+
+    // 죽은 자리 주변 9칸 모두 실패 → 기존 균등 스폰으로 폴백
+    spawn_balanced_particle(viewport, cache, nodes, life, counts, max_per_cell, rng)
 }
 
 /// 면적 가중 삼각형 스폰 + 밀도 rejection

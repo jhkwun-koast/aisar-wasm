@@ -14,3 +14,8 @@ serde-wasm-bindgen = "0.6.5"
 web-sys = { version = "0.3.70", features = ["console", "Window", "Document", "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "CanvasGradient", "Performance"] }
 js-sys = "0.3.70"
 getrandom = { version = "0.2", features = ["js"] }
+# lib.rs가 use rand::..., use rand_xoshiro::...로 참조하지만 Cargo.toml에는 선언돼 있지 않아
+# master HEAD가 애초에 빌드되지 않는 상태였다(2026-08 발견) — 기존 getrandom 0.2(js 피처)와
+# 호환되는 rand_core 0.6 계열로 버전을 맞춘다.
+rand = "0.8"
+rand_xoshiro = "0.6"

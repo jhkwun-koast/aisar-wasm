@@ -45,6 +45,16 @@ fn find_min_data_in_bounds<'a> (
     points
 }
 
+/// interpolate_uv(lib.rs, legacy R-tree 경로)는 mask_data 없이 이 모듈의 IDW/BICUBIC/NEAREST를
+/// 호출한다 — 호출부 리팩토링 당시 mask_data 인자가 빠졌지만 이 파일의 시그니처는 갱신되지
+/// 않아 컴파일이 깨져 있었다(2026-08 발견, master HEAD). find_min_data_in_bounds는 그대로 두고
+/// (kriging/bilinear는 여전히 실제 mask_data를 받는 호출부를 가정), mask_data가 없는 세 함수만
+/// "항상 비마스크(바다)"로 취급하는 버퍼를 내부에서 만들어 넘긴다. 빈 벡터를 넘기면
+/// is_masked()가 인덱스 초과로 패닉할 수 있어 width*height*4 크기로 채운다.
+fn unmasked_buffer(size: [f64; 2]) -> Vec<u8> {
+    vec![1u8; (size[0].max(1.0) as usize) * (size[1].max(1.0) as usize) * 4]
+}
+
 pub fn interpolate_by_kriging(particle_coord: Coordinate, rtree: &RTree<WeatherData>, min_points: Option<usize>, mask_data: &Vec<u8>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
     let points = find_min_data_in_bounds(particle_coord, rtree, min_points, None, None,mask_data,extent,resolution,size);
 
@@ -99,8 +109,19 @@ pub fn calculate_kriging_weights(
     weights
 }
 
-pub fn interpolate_by_inverse_distance_weighted (particle_coord:Coordinate, rtree: &RTree<WeatherData>, min_points: Option<usize>, mask_data: &Vec<u8>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
-    let points = find_min_data_in_bounds(particle_coord, rtree, min_points, None, None,mask_data,extent,resolution,size);
+/// 가장 가까운 관측점 1개의 u/v를 그대로 반환 — "NEAREST" 모드용. legacy 경로 전용(위 주석 참고).
+pub fn interpolate(particle_coord: Coordinate, rtree: &RTree<WeatherData>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
+    let mask_data = unmasked_buffer(size);
+    let points = find_min_data_in_bounds(particle_coord, rtree, Some(1), None, None, &mask_data, extent, resolution, size);
+    match points.first() {
+        Some(nearest) => (nearest.udata, nearest.vdata),
+        None => (0.0, 0.0),
+    }
+}
+
+pub fn interpolate_by_inverse_distance_weighted (particle_coord:Coordinate, rtree: &RTree<WeatherData>, min_points: Option<usize>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
+    let mask_data = unmasked_buffer(size);
+    let points = find_min_data_in_bounds(particle_coord, rtree, min_points, None, None,&mask_data,extent,resolution,size);
 
     if points.len() == 0 {
         return (0.0, 0.0);
@@ -178,8 +199,9 @@ pub fn interpolate_by_bilinear(particle_coord: Coordinate, rtree: &RTree<Weather
     (u_sum / total_weight, v_sum / total_weight)
 }
 
-pub fn interpolate_by_bicubic(particle_coord: Coordinate, rtree: &RTree<WeatherData>, mask_data: &Vec<u8>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
-    let points = find_min_data_in_bounds(particle_coord, rtree, Some(16), None, None,mask_data,extent,resolution,size);
+pub fn interpolate_by_bicubic(particle_coord: Coordinate, rtree: &RTree<WeatherData>, extent: SimpleBounds, resolution: f64, size: [f64; 2]) -> (f64, f64) {
+    let mask_data = unmasked_buffer(size);
+    let points = find_min_data_in_bounds(particle_coord, rtree, Some(16), None, None,&mask_data,extent,resolution,size);
 
     // 16개의 주변 포인트 찾기
     if points.len() < 16 {
